@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO, Mapping, Sequence
 
 import httpx
 
 from citation_index_api_client.exceptions import APIError, JobFailedError, JobTimeoutError
-from citation_index_api_client.models import JobResponse, JobStatus
+from citation_index_api_client.models import JobResponse, JobStatus, LinkedReference
 
 DEFAULT_BASE_URL = (
     "https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl"
 )
+LINKING_TARGETS = ("openalex", "matilda", "wikidata")
 
 
 class CitationIndexClient:
@@ -177,6 +178,48 @@ class CitationIndexClient:
             },
         )
         return JobResponse.from_dict(data)
+
+    def link_references(
+        self,
+        references: str | Sequence[str],
+        *,
+        target: str | Sequence[str] = "all",
+    ) -> JobResponse:
+        """POST /link/references — enqueue linking against external indexes."""
+        if isinstance(references, str):
+            batched = False
+            reference = references.strip()
+        else:
+            entries = [item.strip() for item in references if item and item.strip()]
+            if not entries:
+                raise ValueError("At least one non-empty reference is required")
+            batched = True
+            reference = "\n".join(entries)
+        if not reference:
+            raise ValueError("At least one non-empty reference is required")
+
+        data = self._post_json(
+            "/link/references",
+            json={"reference": reference},
+            params={
+                "batched": batched,
+                "target": target if isinstance(target, str) else ",".join(target),
+            },
+        )
+        return JobResponse.from_dict(data)
+
+    def wait_for_links(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 2.0,
+        timeout: float = 600.0,
+    ) -> list[LinkedReference]:
+        """Wait for a linking job, then return its results as dataclasses."""
+        result = self.wait_for_result(
+            job_id, poll_interval=poll_interval, timeout=timeout
+        )
+        return [LinkedReference.from_dict(item) for item in result.get("results", [])]
 
     def _enqueue_text_upload(
         self,

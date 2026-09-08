@@ -6,7 +6,12 @@ from citation_index_api_client.exceptions import (
     JobFailedError,
     JobTimeoutError,
 )
-from citation_index_api_client.models import JobResponse, JobStatus
+from citation_index_api_client.models import (
+    JobResponse,
+    JobStatus,
+    LinkedReference,
+    ReferenceLink,
+)
 
 __all__ = [
     "APIError",
@@ -15,6 +20,8 @@ __all__ = [
     "JobResponse",
     "JobStatus",
     "JobTimeoutError",
+    "LinkedReference",
+    "ReferenceLink",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

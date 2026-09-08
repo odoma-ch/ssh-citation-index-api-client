@@ -54,3 +54,37 @@ class JobStatus:
     @property
     def is_terminal(self) -> bool:
         return self.status in ("completed", "failed")
+
+
+@dataclass(frozen=True)
+class ReferenceLink:
+    """Identifier resolved for one reference in one target index."""
+
+    id: str | None = None
+    doi: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReferenceLink:
+        return cls(id=data.get("id"), doi=data.get("doi"))
+
+    @property
+    def is_linked(self) -> bool:
+        return self.id is not None
+
+
+@dataclass(frozen=True)
+class LinkedReference:
+    """One reference and its per-target linking outcome."""
+
+    reference: str
+    links: dict[str, ReferenceLink]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LinkedReference:
+        return cls(
+            reference=data["reference"],
+            links={
+                name: ReferenceLink.from_dict(link)
+                for name, link in (data.get("links") or {}).items()
+            },
+        )

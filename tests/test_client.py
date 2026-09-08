@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -7,11 +9,16 @@ from citation_index_api_client import (
     JobFailedError,
     JobTimeoutError,
 )
-from citation_index_api_client.models import JobResponse, JobStatus
+from citation_index_api_client.models import JobResponse, JobStatus, ReferenceLink
 
 
 @pytest.fixture
-def transport():
+def link_requests():
+    return []
+
+
+@pytest.fixture
+def transport(link_requests):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json={"status": "ok"})
@@ -40,6 +47,36 @@ def transport():
                     "job_id": "parse-1",
                     "status": "queued",
                     "created_at": "2025-01-01T00:00:00Z",
+                },
+            )
+        if request.url.path == "/link/references":
+            link_requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "link-1",
+                    "status": "queued",
+                    "created_at": "2025-01-01T00:00:00Z",
+                },
+            )
+        if request.url.path == "/jobs/link-1/status":
+            return httpx.Response(200, json={"job_id": "link-1", "status": "completed"})
+        if request.url.path == "/jobs/link-1":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "reference": "Smith, J. (2020). Title.",
+                            "links": {
+                                "openalex": {
+                                    "id": "https://openalex.org/W1",
+                                    "doi": "10.1234/abc",
+                                },
+                                "wikidata": {"id": None, "doi": None},
+                            },
+                        }
+                    ]
                 },
             )
         if request.url.path == "/extract/text":
@@ -87,6 +124,47 @@ def test_extract_references(client):
 def test_parse_references(client):
     job = client.parse_references(["Smith, J. (2020). Title."])
     assert job.job_id == "parse-1"
+
+
+def test_link_references_single(client, link_requests):
+    job = client.link_references("Smith, J. (2020). Title.")
+    assert job.job_id == "link-1"
+    assert isinstance(job, JobResponse)
+    request = link_requests[-1]
+    assert request.url.params["batched"] == "false"
+    assert request.url.params["target"] == "all"
+    assert json.loads(request.content) == {"reference": "Smith, J. (2020). Title."}
+
+
+def test_link_references_batched(client, link_requests):
+    client.link_references(
+        ["  first ref ", "", "second ref"],
+        target=["openalex", "wikidata"],
+    )
+    request = link_requests[-1]
+    assert request.url.params["batched"] == "true"
+    assert request.url.params["target"] == "openalex,wikidata"
+    assert json.loads(request.content) == {"reference": "first ref\nsecond ref"}
+
+
+def test_link_references_rejects_empty(client):
+    with pytest.raises(ValueError):
+        client.link_references(["", "   "])
+    with pytest.raises(ValueError):
+        client.link_references("   ")
+
+
+def test_wait_for_links(client):
+    job = client.link_references("Smith, J. (2020). Title.")
+    linked = client.wait_for_links(job.job_id, poll_interval=0.01)
+    assert len(linked) == 1
+    assert linked[0].reference == "Smith, J. (2020). Title."
+    assert linked[0].links["openalex"] == ReferenceLink(
+        id="https://openalex.org/W1",
+        doi="10.1234/abc",
+    )
+    assert linked[0].links["openalex"].is_linked
+    assert not linked[0].links["wikidata"].is_linked
 
 
 def test_extract_text_file(tmp_path, client):
