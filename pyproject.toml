@@ -18,6 +18,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-httpx>=0.30.0",
 ]
+# Gradio requires Python >=3.10, so the front-end stays an optional extra.
+app = [
+    "gradio>=6.0.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/citation_index_api_client"]

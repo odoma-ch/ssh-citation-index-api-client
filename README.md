@@ -110,6 +110,51 @@ bounded batches and raise `timeout` accordingly.
 - `JobFailedError` — job finished with `status == "failed"`
 - `JobTimeoutError` — `wait_for_job` / `wait_for_result` exceeded `timeout`
 
+## Web interface
+
+A read-only [Gradio](https://www.gradio.app/) front-end makes the API usable
+without writing Python. Gradio requires Python 3.10 or newer, so it ships as an
+optional extra:
+
+```bash
+pip install -e ".[app]"
+python app/gradio_app.py
+```
+
+The interface opens on <http://127.0.0.1:7860> with three tabs:
+
+- **From a document** — runs extraction, parsing and linking in sequence,
+  streaming the status of each stage. Upload a PDF and pick an extractor
+  (`mineru` or `pymupdf`), or paste Markdown you already have to skip text
+  extraction entirely. The parser dropdown selects `llm` or `grobid`
+- **From reference strings** — links pasted references without a document
+- **Look up a job** — shows the status and result of a job ID, so a long
+  extraction survives closing the browser
+
+By default only the first few extracted references are linked, since every
+reference is looked up once per selected target against live external services.
+Tick **Link every extracted reference** to process them all, or use the slider
+for anything in between.
+
+The reference and link tables are read-only and downloadable as CSV. Structured
+records from the parser are download-only — they are too wide to read in a
+browser table. Configure the interface through environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITATION_INDEX_API` | staging URL | API base URL |
+| `CITATION_INDEX_JOB_TIMEOUT` | `1800` | seconds before a job is abandoned |
+| `CITATION_INDEX_POLL_INTERVAL` | `2` | seconds between status polls |
+| `CITATION_INDEX_LINKING_LIMIT` | `25` | starting position of the "references to link" slider |
+| `CITATION_INDEX_LINKING_MAX` | `500` | ceiling on references per linking batch |
+| `CITATION_INDEX_UI_AUTH` | unset | `user:password` login gate |
+| `CITATION_INDEX_UI_HOST` / `_PORT` | `127.0.0.1` / `7860` | bind address |
+| `CITATION_INDEX_UI_MAX_UPLOAD` | `50mb` | upload size cap |
+
+Set `CITATION_INDEX_UI_AUTH` before exposing the interface beyond localhost —
+the API itself is unauthenticated, and the extraction and parsing endpoints are
+LLM-backed.
+
 ## Interactive notebook
 
 ```bash
