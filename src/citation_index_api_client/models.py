@@ -76,7 +76,7 @@ class ReferenceLink:
 class LinkedReference:
     """One reference and its per-target linking outcome."""
 
-    reference: str
+    reference: dict[str, Any]
     links: dict[str, ReferenceLink]
 
     @classmethod

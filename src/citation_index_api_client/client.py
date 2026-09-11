@@ -15,6 +15,28 @@ DEFAULT_BASE_URL = (
 LINKING_TARGETS = ("openalex", "matilda", "wikidata")
 
 
+def is_linkable(record: Mapping[str, Any]) -> bool:
+    """Whether a parsed record has the fields the linking endpoint requires.
+
+    ``POST /link/references`` rejects the whole batch with a 422 if any record
+    is missing a non-empty ``full_title``, a non-empty ``authors`` list, or an
+    integer ``publication_year`` (1–9999) — yet the parser routinely emits
+    records with those fields ``None`` (e.g. "op. cit." citations). Filter with
+    this before submitting so the linkable records still get through.
+    """
+    title = record.get("full_title")
+    authors = record.get("authors")
+    year = record.get("publication_year")
+    return bool(
+        isinstance(title, str)
+        and title.strip()
+        and isinstance(authors, list)
+        and authors
+        and isinstance(year, int)
+        and 1 <= year <= 9999
+    )
+
+
 class CitationIndexClient:
     """Sync client for the Citation Index REST API.
 
@@ -181,22 +203,22 @@ class CitationIndexClient:
 
     def link_references(
         self,
-        references: str | Sequence[str],
+        references: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         target: str | Sequence[str] = "all",
     ) -> JobResponse:
         """POST /link/references — enqueue linking against external indexes."""
-        if isinstance(references, str):
+        # A dict is a Sequence-like iterable, so it must be matched before the
+        # list branch — otherwise a single record would be iterated by key.
+        if isinstance(references, dict):
             batched = False
-            reference = references.strip()
+            reference: Any = references
         else:
-            entries = [item.strip() for item in references if item and item.strip()]
+            entries = [item for item in references if item]
             if not entries:
                 raise ValueError("At least one non-empty reference is required")
             batched = True
-            reference = "\n".join(entries)
-        if not reference:
-            raise ValueError("At least one non-empty reference is required")
+            reference = entries
 
         data = self._post_json(
             "/link/references",

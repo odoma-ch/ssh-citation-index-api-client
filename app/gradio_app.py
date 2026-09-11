@@ -14,7 +14,12 @@ from typing import Any, Iterator, Sequence
 import gradio as gr
 import pandas as pd
 
-from citation_index_api_client import APIError, CitationIndexClient, LinkedReference
+from citation_index_api_client import (
+    APIError,
+    CitationIndexClient,
+    LinkedReference,
+    is_linkable,
+)
 from citation_index_api_client.client import DEFAULT_BASE_URL, LINKING_TARGETS
 
 BASE_URL = os.getenv("CITATION_INDEX_API", DEFAULT_BASE_URL)
@@ -116,11 +121,22 @@ def _reference_rows(references: Sequence[str]) -> list[list[Any]]:
     return [[i, reference] for i, reference in enumerate(references, start=1)]
 
 
+def _reference_label(reference: Any) -> str:
+    """A one-line label for a linking record (its title), for table display."""
+    if isinstance(reference, dict):
+        for key in ("full_title", "analytic_title", "monographic_title", "journal_title"):
+            if reference.get(key):
+                return str(reference[key])
+        return json.dumps(reference, ensure_ascii=False)
+    return str(reference)
+
+
 def _link_rows(linked: Sequence[LinkedReference]) -> list[list[Any]]:
     rows: list[list[Any]] = []
     for i, item in enumerate(linked, start=1):
+        label = _reference_label(item.reference)
         for target, link in item.links.items():
-            rows.append([i, item.reference, target, link.id or "", link.doi or ""])
+            rows.append([i, label, target, link.id or "", link.doi or ""])
     return rows
 
 
@@ -195,10 +211,10 @@ def _checked_targets(targets: Sequence[str]) -> list[str]:
     return list(targets)
 
 
-def _link(references: Sequence[str], targets: Sequence[str], label: str):
-    """Submit a linking batch and yield status lines, then the parsed results."""
+def _link(records: Sequence[dict[str, Any]], targets: Sequence[str], label: str):
+    """Submit a linking batch of parsed records; yield status, then the results."""
     try:
-        job = client.link_references(list(references), target=list(targets))
+        job = client.link_references(list(records), target=list(targets))
     except APIError as exc:
         raise gr.Error(f"{label} could not be submitted: {_describe(exc)}") from exc
     yield f"{label}… queued as {job.job_id}", None
@@ -250,92 +266,120 @@ def run_pipeline(
             state["raw"],
         )
 
-    if from_pdf:
-        stem = re.sub(r"[^\w.-]+", "_", Path(pdf_path).stem)[:40] or "document"
+    # Any stage may fail (a job errors, the API is down). Catch it here, report
+    # it in the status line and yield the snapshot so far — never let the
+    # exception abort the generator, which would discard the partial results
+    # (references, CSVs) already produced by earlier stages.
+    try:
+        if from_pdf:
+            stem = re.sub(r"[^\w.-]+", "_", Path(pdf_path).stem)[:40] or "document"
+            try:
+                job = client.extract_text(pdf_path, extractor=extractor, markdown=True)
+            except APIError as exc:
+                raise gr.Error(
+                    f"Text extraction could not be submitted: {_describe(exc)}"
+                ) from exc
+            state["status"] = f"Text extraction… queued as {job.job_id}"
+            yield snapshot()
+            for update in _poll(job.job_id, label="Extracting text"):
+                state["status"] = update
+                yield snapshot()
+
+            text = _result(job.job_id, label="text extraction").get("text") or ""
+            if not text.strip():
+                raise gr.Error("Text extraction returned an empty document.")
+        else:
+            stem = "pasted-markdown"
+            text = markdown_text or ""
+
+        state["text"] = text
+        state["status"] = f"{len(text):,} characters of text. Finding references…"
+        yield snapshot()
+
         try:
-            job = client.extract_text(pdf_path, extractor=extractor, markdown=True)
+            job = client.extract_references(text)
         except APIError as exc:
             raise gr.Error(
-                f"Text extraction could not be submitted: {_describe(exc)}"
+                f"Reference extraction could not be submitted: {_describe(exc)}"
             ) from exc
-        state["status"] = f"Text extraction… queued as {job.job_id}"
-        yield snapshot()
-        for update in _poll(job.job_id, label="Extracting text"):
+        for update in _poll(job.job_id, label="Extracting references"):
             state["status"] = update
             yield snapshot()
 
-        text = _result(job.job_id, label="text extraction").get("text") or ""
-        if not text.strip():
-            raise gr.Error("Text extraction returned an empty document.")
-    else:
-        stem = "pasted-markdown"
-        text = markdown_text or ""
-
-    state["text"] = text
-    state["status"] = f"{len(text):,} characters of text. Finding references…"
-    yield snapshot()
-
-    try:
-        job = client.extract_references(text)
-    except APIError as exc:
-        raise gr.Error(
-            f"Reference extraction could not be submitted: {_describe(exc)}"
-        ) from exc
-    for update in _poll(job.job_id, label="Extracting references"):
-        state["status"] = update
-        yield snapshot()
-
-    references = _result(job.job_id, label="reference extraction").get("references") or []
-    if not references:
-        raise gr.Error("No references were found in this document.")
-    state["references"] = _reference_rows(references)
-    state["references_csv"] = _write_csv(
-        f"{stem}-references.csv", REFERENCE_HEADERS, state["references"]
-    )
-    state["status"] = f"Found {len(references)} references. Parsing with {parser}…"
-    yield snapshot()
-
-    try:
-        job = client.parse_references(list(references), parser=parser)
-    except APIError as exc:
-        raise gr.Error(
-            f"Reference parsing could not be submitted: {_describe(exc)}"
-        ) from exc
-    for update in _poll(job.job_id, label=f"Parsing references ({parser})"):
-        state["status"] = update
-        yield snapshot()
-
-    parsed = _result(job.job_id, label="reference parsing").get("references") or []
-    if parsed:
-        state["parsed_csv"] = _write_frame_csv(
-            f"{stem}-parsed.csv", _parsed_frame(parsed)
+        references = (
+            _result(job.job_id, label="reference extraction").get("references") or []
         )
+        if not references:
+            raise gr.Error("No references were found in this document.")
+        state["references"] = _reference_rows(references)
+        state["references_csv"] = _write_csv(
+            f"{stem}-references.csv", REFERENCE_HEADERS, state["references"]
+        )
+        state["status"] = f"Found {len(references)} references. Parsing with {parser}…"
+        yield snapshot()
 
-    to_link = references if link_all else references[: max(1, int(link_limit))]
-    state["status"] = (
-        f"Parsed {len(parsed)} references. Linking {len(to_link)} of "
-        f"{len(references)}…"
-    )
-    yield snapshot()
-
-    linked: list[LinkedReference] = []
-    for update, result in _link(to_link, chosen, "Linking references"):
-        if update is not None:
+        try:
+            job = client.parse_references(list(references), parser=parser)
+        except APIError as exc:
+            raise gr.Error(
+                f"Reference parsing could not be submitted: {_describe(exc)}"
+            ) from exc
+        for update in _poll(job.job_id, label=f"Parsing references ({parser})"):
             state["status"] = update
             yield snapshot()
-        if result is not None:
-            linked = result
 
-    state["links"] = _link_rows(linked)
-    state["links_csv"] = _write_csv(f"{stem}-links.csv", LINK_HEADERS, state["links"])
-    state["raw"] = _raw_links(linked)
-    hits = sum(link.is_linked for item in linked for link in item.links.values())
-    lookups = sum(len(item.links) for item in linked)
-    state["status"] = (
-        f"Done. {len(references)} references extracted, {len(parsed)} parsed, "
-        f"{len(linked)} linked, {hits}/{lookups} target lookups matched."
-    )
-    yield snapshot()
+        parsed = _result(job.job_id, label="reference parsing").get("references") or []
+        if parsed:
+            state["parsed_csv"] = _write_frame_csv(
+                f"{stem}-parsed.csv", _parsed_frame(parsed)
+            )
+        if not parsed:
+            raise gr.Error(
+                "Parsing produced no structured records, so there is nothing to link."
+            )
+
+        # Linking consumes the structured parsed records, but the endpoint
+        # rejects the whole batch if any record lacks a title, authors or year —
+        # which the parser routinely leaves null — so drop those first.
+        linkable = [record for record in parsed if is_linkable(record)]
+        skipped = len(parsed) - len(linkable)
+        if not linkable:
+            raise gr.Error(
+                f"None of the {len(parsed)} parsed records have the title, authors "
+                "and year that linking requires."
+            )
+        to_link = linkable if link_all else linkable[: max(1, int(link_limit))]
+        skipped_note = f" ({skipped} skipped, missing title/authors/year)" if skipped else ""
+        state["status"] = (
+            f"Parsed {len(parsed)} references. Linking {len(to_link)} of "
+            f"{len(linkable)} linkable{skipped_note}…"
+        )
+        yield snapshot()
+
+        linked: list[LinkedReference] = []
+        for update, result in _link(to_link, chosen, "Linking references"):
+            if update is not None:
+                state["status"] = update
+                yield snapshot()
+            if result is not None:
+                linked = result
+
+        state["links"] = _link_rows(linked)
+        state["links_csv"] = _write_csv(
+            f"{stem}-links.csv", LINK_HEADERS, state["links"]
+        )
+        state["raw"] = _raw_links(linked)
+        hits = sum(link.is_linked for item in linked for link in item.links.values())
+        lookups = sum(len(item.links) for item in linked)
+        state["status"] = (
+            f"Done. {len(references)} references extracted, {len(parsed)} parsed, "
+            f"{len(linked)} linked, {hits}/{lookups} target lookups matched."
+        )
+        yield snapshot()
+    except gr.Error as exc:
+        # Keep whatever earlier stages produced; report where it stopped.
+        state["status"] = f"Stopped: {exc}"
+        yield snapshot()
 
 
 def run_linking(raw_text: str, targets: Sequence[str]):
@@ -351,9 +395,27 @@ def run_linking(raw_text: str, targets: Sequence[str]):
         )
     chosen = _checked_targets(targets)
 
-    yield f"Submitting {len(references)} references…", None, None, None
+    # Linking now consumes structured records, so the pasted strings are parsed
+    # first (an extra LLM round trip) before they can be linked.
+    yield f"Parsing {len(references)} references…", None, None, None
+    try:
+        job = client.parse_references(references, parser="llm")
+    except APIError as exc:
+        raise gr.Error(
+            f"Reference parsing could not be submitted: {_describe(exc)}"
+        ) from exc
+    for update in _poll(job.job_id, label="Parsing references"):
+        yield update, None, None, None
+    records = _result(job.job_id, label="reference parsing").get("references") or []
+    records = [record for record in records if is_linkable(record)]
+    if not records:
+        raise gr.Error(
+            "None of the pasted references parsed into a record with the title, "
+            "authors and year that linking requires."
+        )
+
     linked: list[LinkedReference] = []
-    for update, result in _link(references, chosen, "Linking references"):
+    for update, result in _link(records, chosen, "Linking references"):
         if update is not None:
             yield update, None, None, None
         if result is not None:
@@ -541,7 +603,9 @@ def build_demo() -> gr.Blocks:
         with gr.Tab("From reference strings"):
             gr.Markdown(
                 "Paste references, one per line, to link them without a document. "
-                "An empty ID and DOI means the target found no confident match."
+                "Each is parsed into a structured record first (the linking API no "
+                "longer accepts raw strings), then linked. An empty ID and DOI means "
+                "the target found no confident match."
             )
             with gr.Row():
                 with gr.Column(scale=1):

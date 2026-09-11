@@ -8,6 +8,7 @@ from citation_index_api_client import (
     CitationIndexClient,
     JobFailedError,
     JobTimeoutError,
+    is_linkable,
 )
 from citation_index_api_client.models import JobResponse, JobStatus, ReferenceLink
 
@@ -67,7 +68,11 @@ def transport(link_requests):
                 json={
                     "results": [
                         {
-                            "reference": "Smith, J. (2020). Title.",
+                            "reference": {
+                                "full_title": "Title",
+                                "authors": [{"surname": "Smith"}],
+                                "publication_year": 2020,
+                            },
                             "links": {
                                 "openalex": {
                                     "id": "https://openalex.org/W1",
@@ -126,39 +131,58 @@ def test_parse_references(client):
     assert job.job_id == "parse-1"
 
 
+RECORD = {"full_title": "Title", "authors": [{"surname": "Smith"}], "publication_year": 2020}
+
+
 def test_link_references_single(client, link_requests):
-    job = client.link_references("Smith, J. (2020). Title.")
+    job = client.link_references(RECORD)
     assert job.job_id == "link-1"
     assert isinstance(job, JobResponse)
     request = link_requests[-1]
     assert request.url.params["batched"] == "false"
     assert request.url.params["target"] == "all"
-    assert json.loads(request.content) == {"reference": "Smith, J. (2020). Title."}
+    assert json.loads(request.content) == {"reference": RECORD}
 
 
 def test_link_references_batched(client, link_requests):
+    second = {"full_title": "Other", "authors": [{"surname": "Doe"}], "publication_year": 2021}
     client.link_references(
-        ["  first ref ", "", "second ref"],
+        [RECORD, second],
         target=["openalex", "wikidata"],
     )
     request = link_requests[-1]
     assert request.url.params["batched"] == "true"
     assert request.url.params["target"] == "openalex,wikidata"
-    assert json.loads(request.content) == {"reference": "first ref\nsecond ref"}
+    assert json.loads(request.content) == {"reference": [RECORD, second]}
+
+
+def test_is_linkable():
+    assert is_linkable(RECORD)
+    # Missing / null required fields — all rejected by the linking endpoint.
+    assert not is_linkable({"full_title": None, "authors": [{"surname": "X"}], "publication_year": 2020})
+    assert not is_linkable({"full_title": "   ", "authors": [{"surname": "X"}], "publication_year": 2020})
+    assert not is_linkable({"full_title": "T", "authors": None, "publication_year": 2020})
+    assert not is_linkable({"full_title": "T", "authors": [], "publication_year": 2020})
+    assert not is_linkable({"full_title": "T", "authors": [{"surname": "X"}], "publication_year": None})
+    assert not is_linkable({"full_title": "T", "authors": [{"surname": "X"}], "publication_year": 12345})
 
 
 def test_link_references_rejects_empty(client):
     with pytest.raises(ValueError):
-        client.link_references(["", "   "])
+        client.link_references([])
     with pytest.raises(ValueError):
-        client.link_references("   ")
+        client.link_references([None])
 
 
 def test_wait_for_links(client):
-    job = client.link_references("Smith, J. (2020). Title.")
+    job = client.link_references(RECORD)
     linked = client.wait_for_links(job.job_id, poll_interval=0.01)
     assert len(linked) == 1
-    assert linked[0].reference == "Smith, J. (2020). Title."
+    assert linked[0].reference == {
+        "full_title": "Title",
+        "authors": [{"surname": "Smith"}],
+        "publication_year": 2020,
+    }
     assert linked[0].links["openalex"] == ReferenceLink(
         id="https://openalex.org/W1",
         doi="10.1234/abc",

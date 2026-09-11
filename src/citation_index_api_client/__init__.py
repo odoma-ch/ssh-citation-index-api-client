@@ -1,6 +1,10 @@
 """Python client for the Citation Index API."""
 
-from citation_index_api_client.client import CitationIndexClient
+from citation_index_api_client.client import (
+    CitationIndexClient,
+    LINKING_TARGETS,
+    is_linkable,
+)
 from citation_index_api_client.exceptions import (
     APIError,
     JobFailedError,
@@ -20,8 +24,10 @@ __all__ = [
     "JobResponse",
     "JobStatus",
     "JobTimeoutError",
+    "LINKING_TARGETS",
     "LinkedReference",
     "ReferenceLink",
+    "is_linkable",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

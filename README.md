@@ -2,7 +2,7 @@
 
 Python client for the [Citation Index API](https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl/openapi.json), which extracts and parses citations from academic PDFs and links them to external scholarly indexes.
 
-The client version tracks the API version it targets: **0.3.0**.
+The client version tracks the API version it targets: **0.3.1**.
 
 ## Install
 
@@ -30,20 +30,24 @@ text_result = client.wait_for_result(job.job_id)
 job = client.extract_references(markdown_text)
 refs = client.wait_for_result(job.job_id)
 
-# Parse raw reference strings
+# Parse raw reference strings into structured records
+from citation_index_api_client import is_linkable
+
 job = client.parse_references(
-    ["Smith, J. (2020). Title. Journal."],
+    ["Smith, J. (2020). Title. Journal. doi:10.1234/abc"],
     parser="llm",
 )
-parsed = client.wait_for_result(job.job_id)
+records = client.wait_for_result(job.job_id)["references"]
 
-# Link references to external scholarly indexes
+# Link references to external scholarly indexes. Linking takes the structured
+# records that parse_references produces, not raw strings. The endpoint rejects
+# the whole batch if any record lacks a title, authors or year, so filter first.
 job = client.link_references(
-    ["Smith, J. (2020). Title. Journal. doi:10.1234/abc"],
+    [r for r in records if is_linkable(r)],
     target="all",  # or "openalex", "wikidata", "openalex,matilda"
 )
 for item in client.wait_for_links(job.job_id):
-    print(item.reference, item.links["openalex"].id)
+    print(item.reference["full_title"], item.links["openalex"].id)
 ```
 
 Use a context manager to ensure the HTTP connection is closed:
@@ -75,21 +79,33 @@ Helper methods:
 
 ## Citation linking
 
-`link_references` accepts either a single reference string or a list, in which case
-the client submits it as a newline-delimited batch (`batched=true`). Supported
-targets are `openalex`, `matilda` and `wikidata`, passed as `"all"`, a single name,
-a comma-separated string, or a list of names. OpenCitations is deliberately not
-a linking target.
+As of API 0.3.1 `link_references` takes structured `LinkingReference` records —
+the mappings `parse_references` returns — rather than raw strings. Pass a single
+record mapping, or a list, which the client submits as a batch (`batched=true`).
+Supported targets are `openalex`, `matilda` and `wikidata`, passed as `"all"`, a
+single name, a comma-separated string, or a list of names. OpenCitations is
+deliberately not a linking target.
 
-Results come back as one `LinkedReference` per submitted reference, each holding a
+Results come back as one `LinkedReference` per submitted record. Each holds the
+submitted record echoed back in `reference` (a mapping, no longer a string) and a
 `links` mapping from target name to a `ReferenceLink` with `id` and `doi`:
 
 ```python
-job = client.link_references(raw_references, target="openalex,wikidata")
+records = client.wait_for_result(parse_job.job_id)["references"]
+job = client.link_references(
+    [r for r in records if is_linkable(r)], target="openalex,wikidata"
+)
 for item in client.wait_for_links(job.job_id):
+    print(item.reference["full_title"])
     for target, link in item.links.items():
         print(target, link.id, link.doi, link.is_linked)
 ```
+
+Linking requires each record to carry a non-empty `full_title`, at least one
+`authors` entry, and an integer `publication_year`; the endpoint returns 422 for
+the whole batch if any record is missing them. The parser regularly emits records
+with those fields `None` (e.g. "op. cit." citations), so pass records through
+`is_linkable` and drop the rest before submitting.
 
 An `id` and `doi` of `None` means the target could not make a confident match —
 the service requires a DOI hit or a near-exact title match — not that the job
