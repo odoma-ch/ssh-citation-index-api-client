@@ -143,7 +143,8 @@ The interface opens on <http://127.0.0.1:7860> with three tabs:
   streaming the status of each stage. Upload a PDF and pick an extractor
   (`mineru` or `pymupdf`), or paste Markdown you already have to skip text
   extraction entirely. The parser dropdown selects `llm` or `grobid`
-- **From reference strings** — links pasted references without a document
+- **From reference strings** — parses pasted references with `llm` or `grobid`,
+  then links them without a document
 - **Look up a job** — shows the status and result of a job ID, so a long
   extraction survives closing the browser
 
@@ -152,9 +153,11 @@ reference is looked up once per selected target against live external services.
 Tick **Link every extracted reference** to process them all, or use the slider
 for anything in between.
 
-The reference and link tables are read-only and downloadable as CSV. Structured
-records from the parser are download-only — they are too wide to read in a
-browser table. Configure the interface through environment variables:
+The reference, parsed reference and link tables are read-only and downloadable
+as CSV. In both input tabs, parsed records appear as soon as parsing finishes
+and remain available if linking fails. The parsed tables use bounded column
+widths and horizontal scrolling for wide records. Configure the interface
+through environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|

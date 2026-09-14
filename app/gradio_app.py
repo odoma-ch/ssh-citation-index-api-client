@@ -142,10 +142,15 @@ def _link_rows(linked: Sequence[LinkedReference]) -> list[list[Any]]:
 
 def _format_mapping(value: dict[str, Any]) -> str:
     """Render the nested records the parser returns — people, identifiers — as text."""
-    for key in ("full_name", "name", "literal"):
+    for key in ("full_name", "literal"):
         if value.get(key):
             return str(value[key])
-    parts = [value.get("forename"), value.get("surname")]
+    parts = [
+        value.get("first_name") or value.get("forename") or value.get("name"),
+        value.get("middle_name"),
+        value.get("name_link"),
+        value.get("surname"),
+    ]
     joined = " ".join(str(part) for part in parts if part)
     if joined:
         return joined
@@ -188,6 +193,22 @@ def _write_frame_csv(name: str, frame: pd.DataFrame) -> str:
     path = _download_path(name)
     frame.to_csv(path, index=False)
     return str(path)
+
+
+def _parsed_table_update(frame: pd.DataFrame | None) -> dict[str, Any]:
+    """Keep text columns readable without squeezing the remaining headers."""
+    widths = []
+    if frame is not None:
+        for field in frame.columns:
+            if field == "#":
+                widths.append(56)
+            elif "title" in field:
+                widths.append(320)
+            elif field in ("authors", "editors"):
+                widths.append(260)
+            else:
+                widths.append(180)
+    return gr.update(value=frame, column_widths=widths)
 
 
 def _raw_links(linked: Sequence[LinkedReference]) -> dict[str, Any]:
@@ -247,6 +268,7 @@ def run_pipeline(
         "status": "",
         "text": None,
         "references": None,
+        "parsed": None,
         "links": None,
         "references_csv": None,
         "parsed_csv": None,
@@ -259,6 +281,7 @@ def run_pipeline(
             state["status"],
             state["text"],
             state["references"],
+            _parsed_table_update(state["parsed"]),
             state["links"],
             state["references_csv"],
             state["parsed_csv"],
@@ -330,8 +353,9 @@ def run_pipeline(
 
         parsed = _result(job.job_id, label="reference parsing").get("references") or []
         if parsed:
+            state["parsed"] = _parsed_frame(parsed)
             state["parsed_csv"] = _write_frame_csv(
-                f"{stem}-parsed.csv", _parsed_frame(parsed)
+                f"{stem}-parsed.csv", state["parsed"]
             )
         if not parsed:
             raise gr.Error(
@@ -382,7 +406,7 @@ def run_pipeline(
         yield snapshot()
 
 
-def run_linking(raw_text: str, targets: Sequence[str]):
+def run_linking(raw_text: str, targets: Sequence[str], parser: str = "llm"):
     """Link reference strings pasted directly into the UI, one per line."""
     references = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
     if not references:
@@ -395,40 +419,51 @@ def run_linking(raw_text: str, targets: Sequence[str]):
         )
     chosen = _checked_targets(targets)
 
-    # Linking now consumes structured records, so the pasted strings are parsed
-    # first (an extra LLM round trip) before they can be linked.
-    yield f"Parsing {len(references)} references…", None, None, None
+    parsed_frame = None
+    parsed_csv = None
+
+    def snapshot(status, rows=None, links_csv=None, raw=None):
+        return status, _parsed_table_update(parsed_frame), rows, parsed_csv, links_csv, raw
+
+    # Linking consumes structured records, so pasted strings are parsed first.
+    yield snapshot(f"Parsing {len(references)} references with {parser}…")
     try:
-        job = client.parse_references(references, parser="llm")
-    except APIError as exc:
-        raise gr.Error(
-            f"Reference parsing could not be submitted: {_describe(exc)}"
-        ) from exc
-    for update in _poll(job.job_id, label="Parsing references"):
-        yield update, None, None, None
-    records = _result(job.job_id, label="reference parsing").get("references") or []
-    records = [record for record in records if is_linkable(record)]
-    if not records:
-        raise gr.Error(
-            "None of the pasted references parsed into a record with the title, "
-            "authors and year that linking requires."
+        try:
+            job = client.parse_references(references, parser=parser)
+        except APIError as exc:
+            raise gr.Error(
+                f"Reference parsing could not be submitted: {_describe(exc)}"
+            ) from exc
+        for update in _poll(job.job_id, label=f"Parsing references ({parser})"):
+            yield snapshot(update)
+        records = _result(job.job_id, label="reference parsing").get("references") or []
+        parsed_frame = _parsed_frame(records)
+        parsed_csv = _write_frame_csv("parsed-references.csv", parsed_frame)
+        yield snapshot(f"Parsed {len(records)} references. Preparing links…")
+        records = [record for record in records if is_linkable(record)]
+        if not records:
+            raise gr.Error(
+                "None of the pasted references parsed into a record with the title, "
+                "authors and year that linking requires."
+            )
+
+        linked: list[LinkedReference] = []
+        for update, result in _link(records, chosen, "Linking references"):
+            if update is not None:
+                yield snapshot(update)
+            if result is not None:
+                linked = result
+
+        rows = _link_rows(linked)
+        hits = sum(link.is_linked for item in linked for link in item.links.values())
+        yield snapshot(
+            f"Done. {hits}/{len(rows)} target lookups matched.",
+            rows,
+            _write_csv("linked-references.csv", LINK_HEADERS, rows),
+            _raw_links(linked),
         )
-
-    linked: list[LinkedReference] = []
-    for update, result in _link(records, chosen, "Linking references"):
-        if update is not None:
-            yield update, None, None, None
-        if result is not None:
-            linked = result
-
-    rows = _link_rows(linked)
-    hits = sum(link.is_linked for item in linked for link in item.links.values())
-    yield (
-        f"Done. {hits}/{len(rows)} target lookups matched.",
-        rows,
-        _write_csv("linked-references.csv", LINK_HEADERS, rows),
-        _raw_links(linked),
-    )
+    except gr.Error as exc:
+        yield snapshot(f"Stopped: {exc}")
 
 
 def lookup_job(job_id: str):
@@ -533,6 +568,12 @@ def build_demo() -> gr.Blocks:
                         interactive=False,
                         wrap=True,
                     )
+                    pipeline_parsed = gr.Dataframe(
+                        label="Parsed references",
+                        headers=["#"],
+                        interactive=False,
+                        wrap=True,
+                    )
                     pipeline_links = gr.Dataframe(
                         label="Links",
                         headers=LINK_HEADERS,
@@ -591,6 +632,7 @@ def build_demo() -> gr.Blocks:
                     pipeline_status,
                     pipeline_text,
                     pipeline_references,
+                    pipeline_parsed,
                     pipeline_links,
                     pipeline_references_csv,
                     pipeline_parsed_csv,
@@ -614,6 +656,12 @@ def build_demo() -> gr.Blocks:
                         lines=12,
                         placeholder="Smith, J. (2020). Title. Journal. doi:10.1234/abc",
                     )
+                    linking_parser = gr.Dropdown(
+                        label="Parser",
+                        choices=PARSERS,
+                        value="llm",
+                        info="How raw reference strings become structured records.",
+                    )
                     linking_targets = gr.CheckboxGroup(
                         label="Linking targets",
                         choices=list(LINKING_TARGETS),
@@ -624,20 +672,33 @@ def build_demo() -> gr.Blocks:
                     linking_status = gr.Textbox(
                         label="Status", interactive=False, lines=2
                     )
+                    linking_parsed = gr.Dataframe(
+                        label="Parsed references",
+                        headers=["#"],
+                        interactive=False,
+                        wrap=True,
+                    )
                     linking_table = gr.Dataframe(
                         label="Links",
                         headers=LINK_HEADERS,
                         interactive=False,
                         wrap=True,
                     )
-                    linking_csv = gr.File(label="Links (CSV)", interactive=False)
+                    with gr.Row():
+                        linking_parsed_csv = gr.File(
+                            label="Parsed references (CSV)", interactive=False
+                        )
+                        linking_csv = gr.File(label="Links (CSV)", interactive=False)
                     with gr.Accordion("Raw response", open=False):
                         linking_raw = gr.JSON(label="JSON")
 
             linking_button.click(
                 run_linking,
-                inputs=[linking_input, linking_targets],
-                outputs=[linking_status, linking_table, linking_csv, linking_raw],
+                inputs=[linking_input, linking_targets, linking_parser],
+                outputs=[
+                    linking_status, linking_parsed, linking_table,
+                    linking_parsed_csv, linking_csv, linking_raw,
+                ],
                 concurrency_limit=2,
             )
 
