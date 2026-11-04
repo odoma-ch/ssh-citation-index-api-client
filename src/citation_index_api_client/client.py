@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Sequence
@@ -12,7 +13,9 @@ from citation_index_api_client.models import JobResponse, JobStatus, LinkedRefer
 DEFAULT_BASE_URL = (
     "https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl"
 )
-LINKING_TARGETS = ("openalex", "matilda", "wikidata")
+LINKING_TARGETS = ("openalex", "matilda", "wikidata", "opencitations")
+API_KEY_ENV = "CITATION_INDEX_API_KEY"
+API_KEY_HEADER = "X-API-Key"
 
 
 def is_linkable(record: Mapping[str, Any]) -> bool:
@@ -37,12 +40,17 @@ def is_linkable(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _drop_none(params: Mapping[str, Any]) -> dict[str, Any]:
+    # httpx sends None as an empty value, which fails enum validation server-side.
+    return {k: v for k, v in params.items() if v is not None}
+
+
 class CitationIndexClient:
     """Sync client for the Citation Index REST API.
 
     Example::
 
-        client = CitationIndexClient()
+        client = CitationIndexClient(api_key="...")  # or set CITATION_INDEX_API_KEY
         job = client.extract_text("paper.pdf")
         result = client.wait_for_result(job.job_id)
     """
@@ -51,11 +59,16 @@ class CitationIndexClient:
         self,
         base_url: str = DEFAULT_BASE_URL,
         *,
+        api_key: str | None = None,
         timeout: float = 60.0,
         headers: Mapping[str, str] | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        api_key = api_key or os.environ.get(API_KEY_ENV)
+        # Sent per request rather than baked into the httpx client, so the key
+        # also reaches an injected client without mutating it.
+        self._auth_headers = {API_KEY_HEADER: api_key} if api_key else {}
         self._owns_client = client is None
         self._client = client or httpx.Client(
             base_url=self.base_url,
@@ -142,44 +155,80 @@ class CitationIndexClient:
         filename: str | None = None,
     ) -> JobResponse:
         """POST /extract/text — enqueue PDF text extraction."""
-        if isinstance(file, (str, Path)):
-            path = Path(file)
-            with path.open("rb") as fh:
-                return self._enqueue_text_upload(
-                    fh,
-                    extractor=extractor,
-                    markdown=markdown,
-                    filename=filename or path.name,
-                )
-        name = filename or getattr(file, "name", "upload.pdf")
-        if isinstance(name, (str, Path)):
-            name = Path(name).name
-        return self._enqueue_text_upload(
+        return self._upload(
+            "/extract/text",
             file,
-            extractor=extractor,
-            markdown=markdown,
-            filename=str(name),
+            filename=filename,
+            params={"extractor": extractor, "markdown": markdown},
         )
 
     def extract_references(
         self,
         text: str,
         *,
-        method: str = "full_text",
+        method: str | None = None,
         prompt_name: str = "prompts/reference_extraction.md",
         temperature: float = 0.3,
     ) -> JobResponse:
-        """POST /extract/references — enqueue reference extraction from markdown."""
+        """POST /extract/references — enqueue LLM reference extraction from markdown.
+
+        ``method`` is ``full_text`` (server default) or ``semantic``.
+        """
         data = self._post_json(
             "/extract/references",
             json={"text": text},
-            params={
-                "method": method,
-                "prompt_name": prompt_name,
-                "temperature": temperature,
-            },
+            params=_drop_none(
+                {
+                    "method": method,
+                    "prompt_name": prompt_name,
+                    "temperature": temperature,
+                }
+            ),
         )
         return JobResponse.from_dict(data)
+
+    def extract_references_from_pdf(
+        self,
+        file: str | Path | BinaryIO,
+        *,
+        include_parsed: bool = False,
+        include_context: bool = False,
+        filename: str | None = None,
+    ) -> JobResponse:
+        """POST /extract/references — enqueue GROBID reference extraction from a PDF.
+
+        ``include_parsed`` adds ``parsed_references``; ``include_context`` adds
+        the citing sentences of each reference.
+        """
+        return self._upload(
+            "/extract/references",
+            file,
+            filename=filename,
+            params={
+                "method": "grobid",
+                "include_parsed": include_parsed,
+                "include_context": include_context,
+            },
+        )
+
+    def process_references_grobid(
+        self,
+        file: str | Path | BinaryIO,
+        *,
+        include_context: bool = False,
+        filename: str | None = None,
+    ) -> JobResponse:
+        """POST /process/references/grobid — PDF to raw and parsed references.
+
+        The result holds index-aligned ``references``, ``parsed_references`` and,
+        with ``include_context``, ``contexts`` ready for :meth:`classify_citations`.
+        """
+        return self._upload(
+            "/process/references/grobid",
+            file,
+            filename=filename,
+            params={"include_context": include_context},
+        )
 
     def parse_references(
         self,
@@ -230,6 +279,28 @@ class CitationIndexClient:
         )
         return JobResponse.from_dict(data)
 
+    def classify_citations(
+        self,
+        citations: Sequence[Mapping[str, Any]],
+        *,
+        mode: str = "M",
+    ) -> JobResponse:
+        """POST /classify/citations — enqueue citation-intent classification.
+
+        Each citation is ``{"section": ..., "citation": ...}`` (section may be
+        ``""``); GROBID ``contexts`` can be passed as-is. ``mode`` is ``WS``
+        (with sections), ``WoS`` (without) or ``M`` (per item).
+        """
+        entries = [item for item in citations if item]
+        if not entries:
+            raise ValueError("At least one citation is required")
+        data = self._post_json(
+            "/classify/citations",
+            json={"citations": entries},
+            params={"mode": mode},
+        )
+        return JobResponse.from_dict(data)
+
     def wait_for_links(
         self,
         job_id: str,
@@ -243,19 +314,25 @@ class CitationIndexClient:
         )
         return [LinkedReference.from_dict(item) for item in result.get("results", [])]
 
-    def _enqueue_text_upload(
+    def _upload(
         self,
-        file_obj: BinaryIO,
+        path: str,
+        file: str | Path | BinaryIO,
         *,
-        extractor: str,
-        markdown: bool,
-        filename: str,
+        filename: str | None,
+        params: Mapping[str, Any],
     ) -> JobResponse:
+        if isinstance(file, (str, Path)):
+            with Path(file).open("rb") as fh:
+                return self._upload(
+                    path, fh, filename=filename or Path(file).name, params=params
+                )
+        name = filename or getattr(file, "name", None) or "upload.pdf"
         response = self._request(
             "POST",
-            "/extract/text",
-            params={"extractor": extractor, "markdown": markdown},
-            files={"file": (filename, file_obj, "application/pdf")},
+            path,
+            params=params,
+            files={"file": (Path(str(name)).name, file, "application/pdf")},
         )
         return JobResponse.from_dict(response.json())
 
@@ -266,7 +343,8 @@ class CitationIndexClient:
         return self._request("POST", path, **kwargs).json()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        response = self._client.request(method, path, **kwargs)
+        headers = {**self._auth_headers, **kwargs.pop("headers", {})}
+        response = self._client.request(method, path, headers=headers, **kwargs)
         if response.is_success:
             return response
         detail: Any | None

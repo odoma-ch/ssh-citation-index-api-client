@@ -2,7 +2,7 @@
 
 Python client for the [Citation Index API](https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl/openapi.json), which extracts and parses citations from academic PDFs and links them to external scholarly indexes.
 
-The client version tracks the API version it targets: **0.3.1**.
+The client version tracks the API version it targets: **0.4.2**.
 
 ## Install
 
@@ -17,7 +17,9 @@ pip install -e ".[dev]"
 ```python
 from citation_index_api_client import CitationIndexClient
 
-client = CitationIndexClient()  # staging URL by default
+# Every endpoint needs an API key, sent as the X-API-Key header. Pass it
+# explicitly or set CITATION_INDEX_API_KEY in the environment.
+client = CitationIndexClient(api_key="your-key")  # staging URL by default
 
 # Health check
 print(client.health())
@@ -44,11 +46,36 @@ records = client.wait_for_result(job.job_id)["references"]
 # the whole batch if any record lacks a title, authors or year, so filter first.
 job = client.link_references(
     [r for r in records if is_linkable(r)],
-    target="all",  # or "openalex", "wikidata", "openalex,matilda"
+    target="all",  # or "openalex", "wikidata", "openalex,opencitations"
 )
 for item in client.wait_for_links(job.job_id):
     print(item.reference["full_title"], item.links["openalex"].id)
 ```
+
+## GROBID pipeline and citation classification
+
+API 0.4 adds a GROBID path that goes straight from a PDF to references, plus
+citation-intent classification (method / background / result):
+
+```python
+# PDF -> index-aligned raw references, parsed records and citing contexts
+job = client.process_references_grobid("paper.pdf", include_context=True)
+result = client.wait_for_result(job.job_id)
+references, parsed = result["references"], result["parsed_references"]
+
+# Contexts ({section, citation, ...}) go straight to the classifier.
+# mode: "WS" (with sections), "WoS" (without) or "M" (per item, default)
+job = client.classify_citations(result["contexts"], mode="M")
+intents = client.wait_for_result(job.job_id)
+
+# /extract/references also accepts a PDF upload, which uses GROBID
+job = client.extract_references_from_pdf(
+    "paper.pdf", include_parsed=True, include_context=True
+)
+```
+
+`extract_references(text)` stays the LLM path for Markdown; its `method` is
+`full_text` (server default) or `semantic`.
 
 Use a context manager to ensure the HTTP connection is closed:
 
@@ -67,9 +94,12 @@ with CitationIndexClient(base_url="https://your-api.example") as client:
 | GET | `/jobs/{job_id}/status` | `get_job_status(job_id)` |
 | GET | `/jobs/{job_id}` | `get_job_result(job_id, format="json")` |
 | POST | `/extract/text` | `extract_text(file, ...)` |
-| POST | `/extract/references` | `extract_references(text, ...)` |
+| POST | `/extract/references` | `extract_references(text, ...)` (LLM, Markdown) |
+| POST | `/extract/references` | `extract_references_from_pdf(file, ...)` (GROBID, PDF) |
+| POST | `/process/references/grobid` | `process_references_grobid(file, include_context=False)` |
 | POST | `/parse/references` | `parse_references(references, ...)` |
 | POST | `/link/references` | `link_references(references, target="all")` |
+| POST | `/classify/citations` | `classify_citations(citations, mode="M")` |
 
 Helper methods:
 
@@ -82,9 +112,9 @@ Helper methods:
 As of API 0.3.1 `link_references` takes structured `LinkingReference` records —
 the mappings `parse_references` returns — rather than raw strings. Pass a single
 record mapping, or a list, which the client submits as a batch (`batched=true`).
-Supported targets are `openalex`, `matilda` and `wikidata`, passed as `"all"`, a
-single name, a comma-separated string, or a list of names. OpenCitations is
-deliberately not a linking target.
+Supported targets are `openalex`, `matilda`, `wikidata` and (since API 0.4)
+`opencitations`, passed as `"all"`, a single name, a comma-separated string, or a
+list of names.
 
 Results come back as one `LinkedReference` per submitted record. Each holds the
 submitted record echoed back in `reference` (a mapping, no longer a string) and a
@@ -116,8 +146,10 @@ bounded batches and raise `timeout` accordingly.
 ## Configuration
 
 - **`base_url`** — API root (default: staging deployment)
+- **`api_key`** — sent as `X-API-Key`; falls back to `CITATION_INDEX_API_KEY`.
+  Required by every endpoint since API 0.4 (401 without it)
 - **`timeout`** — per-request HTTP timeout in seconds
-- **`headers`** — extra headers (e.g. auth tokens if required)
+- **`headers`** — extra headers
 - **`client`** — inject a custom `httpx.Client` for testing or advanced setup
 
 ## Errors
@@ -128,53 +160,83 @@ bounded batches and raise `timeout` accordingly.
 
 ## Web interface
 
-A read-only [Gradio](https://www.gradio.app/) front-end makes the API usable
-without writing Python. Gradio requires Python 3.10 or newer, so it ships as an
-optional extra:
+A [Streamlit](https://streamlit.io/) front-end makes every endpoint usable
+without writing Python. It ships as an optional extra:
 
 ```bash
 pip install -e ".[app]"
-python app/gradio_app.py
+export CITATION_INDEX_API_KEY=...   # or enter the key in the sidebar
+streamlit run app/streamlit_app.py
 ```
 
-The interface opens on <http://127.0.0.1:7860> with three tabs:
+It opens on <http://localhost:8501>. The sidebar holds the API key (a key typed
+there stays in that browser session) and shows the API name, version and docs
+link (`GET /`) and whether the key is accepted. The API URL comes only from
+`CITATION_INDEX_API`, so an environment key is never sent to another host. Pages:
 
-- **From a document** — runs extraction, parsing and linking in sequence,
-  streaming the status of each stage. Upload a PDF and pick an extractor
-  (`mineru` or `pymupdf`), or paste Markdown you already have to skip text
-  extraction entirely. The parser dropdown selects `llm` or `grobid`
-- **From reference strings** — parses pasted references with `llm` or `grobid`,
-  then links them without a document
-- **Look up a job** — shows the status and result of a job ID, so a long
-  extraction survives closing the browser
+**Workflow**
 
-By default only the first few extracted references are linked, since every
-reference is looked up once per selected target against live external services.
-Tick **Link every extracted reference** to process them all, or use the slider
-for anything in between.
+- **End-to-end pipeline** — upload a PDF; references are extracted, parsed,
+  linked and their citing sentences classified, each stage showing its own
+  status and job ID. Two routes:
+  - *GROBID* (default) — one `/process/references/grobid` job returns raw
+    references, parsed records and citing sentences, so every step runs
+  - *LLM* — `/extract/text` (PyMuPDF or MinerU), then LLM reference
+    extraction and parsing. No citing sentences, so no classification
 
-The reference, parsed reference and link tables are read-only and downloadable
-as CSV. In both input tabs, parsed records appear as soon as parsing finishes
-and remain available if linking fails. The parsed tables use bounded column
-widths and horizontal scrolling for wide records. Configure the interface
-through environment variables:
+  Results land in tabs: one table joining each reference's raw string, parsed
+  fields and citation intents; links per target (IDs are clickable); citation
+  intents per sentence; the document text; and everything as one JSON file.
+  If a later stage fails, earlier results stay.
+
+**Single steps** — each covers one endpoint and can hand its output to the next:
+
+- **Extract** — PDF → text (`/extract/text`, any extractor); Markdown →
+  references (`/extract/references`, LLM, `full_text` or `semantic`); PDF →
+  references (`/extract/references` upload, GROBID, optionally parsed and with
+  citing sentences)
+- **Parse** — reference strings → structured records (`llm` or `grobid`)
+- **Link** — reference strings (parsed first) or parsed records as JSON →
+  OpenAlex, Matilda, Wikidata, OpenCitations. Records without a title, authors
+  and year are skipped and counted, since the endpoint rejects the whole batch
+- **Classify** — an editable table of section + citing sentence → method,
+  background or result, with ensemble confidences
+- **Jobs** — every job submitted in this browser session; look up any job ID
+  for its status and result (`json` or `xml`)
+
+Jobs keep running on the server when you switch pages. Returning to a page
+resumes polling the same job instead of submitting it again, and a job ID can
+always be looked up on **Jobs**. Reloading the browser tab starts a new
+session, so results shown on pages are lost, but the jobs themselves are not.
+
+Linking defaults to Matilda and sends every linkable reference in one batch.
+Each reference is looked up once per target against live external services, and
+Matilda takes roughly 20 seconds per reference, so a paper with dozens of
+references takes several minutes. Set **Max references to link** to send fewer.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CITATION_INDEX_API` | staging URL | API base URL |
-| `CITATION_INDEX_JOB_TIMEOUT` | `1800` | seconds before a job is abandoned |
+| `CITATION_INDEX_API_KEY` | unset | default API key (sidebar overrides it) |
+| `CITATION_INDEX_JOB_TIMEOUT` | `1800` | seconds before the page stops waiting for a job |
 | `CITATION_INDEX_POLL_INTERVAL` | `2` | seconds between status polls |
-| `CITATION_INDEX_LINKING_LIMIT` | `25` | starting position of the "references to link" slider |
+| `CITATION_INDEX_HTTP_TIMEOUT` | `120` | per-request HTTP timeout |
+| `CITATION_INDEX_LINKING_LIMIT` | unset (all) | default "max references to link" |
 | `CITATION_INDEX_LINKING_MAX` | `500` | ceiling on references per linking batch |
 | `CITATION_INDEX_UI_AUTH` | unset | `user:password` login gate |
-| `CITATION_INDEX_UI_HOST` / `_PORT` | `127.0.0.1` / `7860` | bind address |
-| `CITATION_INDEX_UI_MAX_UPLOAD` | `50mb` | upload size cap |
 
-Set `CITATION_INDEX_UI_AUTH` before exposing the interface beyond localhost —
-the API itself is unauthenticated, and the extraction and parsing endpoints are
-LLM-backed.
+Host, port and upload size are Streamlit's own settings, e.g.
+`STREAMLIT_SERVER_ADDRESS`, `STREAMLIT_SERVER_PORT` and
+`STREAMLIT_SERVER_MAX_UPLOAD_SIZE` (MB), or the matching `--server.*` flags.
+
+Set `CITATION_INDEX_UI_AUTH` before exposing the interface beyond localhost with
+a key in the environment — anyone who can open the page then uses your key, and
+the extraction and parsing endpoints are LLM-backed.
 
 ## Interactive notebook
+
+Set `CITATION_INDEX_API_KEY` before starting Jupyter so the notebook's client
+picks it up.
 
 ```bash
 pip install ipykernel

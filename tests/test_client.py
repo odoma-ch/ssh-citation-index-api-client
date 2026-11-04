@@ -245,3 +245,85 @@ def test_wait_for_job_timeout():
     with pytest.raises(JobTimeoutError):
         client.wait_for_job("x", poll_interval=0.01, timeout=0.05)
     client.close()
+
+
+def _recording_client(monkeypatch, **kwargs):
+    """Client whose transport records every request and answers with a queued job."""
+    monkeypatch.delenv("CITATION_INDEX_API_KEY", raising=False)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"job_id": "j", "status": "queued", "created_at": "2025-01-01T00:00:00Z"},
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.example")
+    return CitationIndexClient(client=http, **kwargs), requests
+
+
+def test_api_key_sent_with_injected_client(monkeypatch):
+    client, requests = _recording_client(monkeypatch, api_key="secret")
+    client.health()
+    assert requests[-1].headers["X-API-Key"] == "secret"
+
+
+def test_api_key_from_env(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    monkeypatch.setenv("CITATION_INDEX_API_KEY", "from-env")
+    client = CitationIndexClient(client=client._client)
+    client.health()
+    assert requests[-1].headers["X-API-Key"] == "from-env"
+
+
+def test_no_api_key_header_when_unset(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    client.health()
+    assert "X-API-Key" not in requests[-1].headers
+
+
+def test_extract_references_omits_unset_method(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    client.extract_references("text")
+    assert "method" not in requests[-1].url.params
+    client.extract_references("text", method="semantic")
+    assert requests[-1].url.params["method"] == "semantic"
+
+
+def test_extract_references_from_pdf(tmp_path, monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    client.extract_references_from_pdf(pdf, include_parsed=True, include_context=True)
+    request = requests[-1]
+    assert request.url.path == "/extract/references"
+    assert request.url.params["method"] == "grobid"
+    assert request.url.params["include_parsed"] == "true"
+    assert request.url.params["include_context"] == "true"
+    assert "prompt_name" not in request.url.params
+    assert request.headers["content-type"].startswith("multipart/form-data")
+    assert b'filename="paper.pdf"' in request.read()
+
+
+def test_process_references_grobid(tmp_path, monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    with pdf.open("rb") as fh:
+        client.process_references_grobid(fh, include_context=True)
+    request = requests[-1]
+    assert request.url.path == "/process/references/grobid"
+    assert request.url.params["include_context"] == "true"
+    assert b'filename="paper.pdf"' in request.read()
+
+
+def test_classify_citations(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    contexts = [{"section": "Intro", "citation": "As shown by Smith (2020)."}]
+    client.classify_citations(contexts, mode="WS")
+    request = requests[-1]
+    assert request.url.params["mode"] == "WS"
+    assert json.loads(request.content) == {"citations": contexts}
+    with pytest.raises(ValueError):
+        client.classify_citations([])
