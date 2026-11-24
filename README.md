@@ -2,7 +2,7 @@
 
 Python client for the [Citation Index API](https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl/openapi.json), which extracts and parses citations from academic PDFs and links them to external scholarly indexes.
 
-The client version tracks the API version it targets: **0.5.1** (plus `container_title` and `/extract/metadata` from the #54 work).
+The client version tracks the API version it targets: **0.6.0**.
 
 ## Install
 
@@ -198,10 +198,8 @@ If no metadata is found the job fails (`JobFailedError`); then type the citing p
 in: `CitingDocument(ids="doi:10.1234/abc")`, or without a DOI
 `CitingDocument(title=..., pub_date="2021", authors=["Surname, Given"])`.
 
-> `/extract/metadata` only exists once API PR
-> [odoma-ch/ssh-citation-index#66](https://github.com/odoma-ch/ssh-citation-index/pull/66)
-> is merged and deployed; until then the staging API returns 404. So far it has only
-> been tried against a local Docker build, not staging.
+`/extract/metadata` needs API 0.6.0 or later.
+
 Validate before depositing: `pip install oc-validator` (part of the `dev` extra).
 
 ## Configuration
