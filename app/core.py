@@ -49,6 +49,7 @@ PARSED_FIELD_ORDER = [
     "authors",
     "publication_year",
     "journal_title",
+    "container_title",
     "monographic_title",
     "analytic_title",
     "editors",
@@ -308,7 +309,7 @@ def strings_frame(strings: Iterable[str], column: str = "reference") -> pd.DataF
 
 def reference_label(reference: Any) -> str:
     if isinstance(reference, Mapping):
-        for key in ("full_title", "analytic_title", "monographic_title", "journal_title"):
+        for key in ("full_title", "analytic_title", "monographic_title", "container_title", "journal_title"):
             if reference.get(key):
                 return str(reference[key])
         return json.dumps(reference, ensure_ascii=False)
@@ -330,8 +331,10 @@ def links_frame(linked: Sequence[LinkedReference], numbers: Sequence[int] | None
             link = item.links.get(target)
             row[target] = (link.id or "") if link else ""
             row[f"{target} DOI"] = (link.doi or "") if link else ""
+            if link and link.error:
+                row[f"{target} error"] = link.error
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).fillna("")
 
 
 def link_stats(linked: Sequence[LinkedReference]) -> tuple[int, int]:
@@ -518,7 +521,8 @@ def show_links(linked: Sequence[LinkedReference], numbers: Sequence[int], name: 
     hits, lookups = link_stats(linked)
     st.caption(
         f"{hits} of {lookups} lookups matched. An empty cell means the target found "
-        "no confident match (it needs a DOI hit or a near-exact title), not an error."
+        "no confident match (it needs a DOI hit or a near-exact title); a failed "
+        "lookup shows its message in the target's error column."
     )
     frame = links_frame(linked, numbers)
     # Target IDs are URLs (OpenAlex, Wikidata, …); make them clickable.

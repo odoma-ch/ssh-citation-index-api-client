@@ -1,8 +1,8 @@
 """Python client for the Citation Index API."""
 
 from citation_index_api_client.client import (
-    CitationIndexClient,
     LINKING_TARGETS,
+    CitationIndexClient,
     is_linkable,
 )
 from citation_index_api_client.exceptions import (
@@ -16,18 +16,26 @@ from citation_index_api_client.models import (
     LinkedReference,
     ReferenceLink,
 )
+from citation_index_api_client.opencitations import (
+    CitingDocument,
+    OpenCitationsDeposit,
+    to_opencitations,
+)
 
 __all__ = [
+    "LINKING_TARGETS",
     "APIError",
     "CitationIndexClient",
+    "CitingDocument",
     "JobFailedError",
     "JobResponse",
     "JobStatus",
     "JobTimeoutError",
-    "LINKING_TARGETS",
     "LinkedReference",
+    "OpenCitationsDeposit",
     "ReferenceLink",
     "is_linkable",
+    "to_opencitations",
 ]
 
-__version__ = "0.4.2"
+__version__ = "0.5.1"

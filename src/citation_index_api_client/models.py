@@ -58,14 +58,25 @@ class JobStatus:
 
 @dataclass(frozen=True)
 class ReferenceLink:
-    """Identifier resolved for one reference in one target index."""
+    """Identifier resolved for one reference in one target index.
+
+    ``score`` is set by ``method="model"``; ``error`` when this target's lookup
+    failed (the other targets' links are still returned).
+    """
 
     id: str | None = None
     doi: str | None = None
+    score: float | None = None
+    error: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReferenceLink:
-        return cls(id=data.get("id"), doi=data.get("doi"))
+        return cls(
+            id=data.get("id"),
+            doi=data.get("doi"),
+            score=data.get("score"),
+            error=data.get("error"),
+        )
 
     @property
     def is_linked(self) -> bool:

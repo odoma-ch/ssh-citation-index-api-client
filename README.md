@@ -2,7 +2,7 @@
 
 Python client for the [Citation Index API](https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl/openapi.json), which extracts and parses citations from academic PDFs and links them to external scholarly indexes.
 
-The client version tracks the API version it targets: **0.4.2**.
+The client version tracks the API version it targets: **0.5.1** (plus `container_title` and `/extract/metadata` from the #54 work).
 
 ## Install
 
@@ -97,8 +97,9 @@ with CitationIndexClient(base_url="https://your-api.example") as client:
 | POST | `/extract/references` | `extract_references(text, ...)` (LLM, Markdown) |
 | POST | `/extract/references` | `extract_references_from_pdf(file, ...)` (GROBID, PDF) |
 | POST | `/process/references/grobid` | `process_references_grobid(file, include_context=False)` |
+| POST | `/extract/metadata` | `extract_metadata(file, method="grobid")` |
 | POST | `/parse/references` | `parse_references(references, ...)` |
-| POST | `/link/references` | `link_references(references, target="all")` |
+| POST | `/link/references` | `link_references(references, target="all", method="match", filter_reviews_by_doi=False)` |
 | POST | `/classify/citations` | `classify_citations(citations, mode="M")` |
 
 Helper methods:
@@ -139,9 +140,69 @@ with those fields `None` (e.g. "op. cit." citations), so pass records through
 
 An `id` and `doi` of `None` means the target could not make a confident match —
 the service requires a DOI hit or a near-exact title match — not that the job
-failed. Matilda may need deployment-specific credentials configured server-side.
+failed. A target whose lookup failed sets `ReferenceLink.error` instead.
+
+Since API 0.5, `method="model"` lets a fine-tuned decider choose among each
+index's search results instead of the title/author/year rules; every record then
+needs `raw_reference` (the original citation string), and links carry a `score`.
+`filter_reviews_by_doi=True` drops candidates whose DOI only names a book review. Matilda may need deployment-specific credentials configured server-side.
 Linking makes live external API calls once per reference per target, so submit
 bounded batches and raise `timeout` accordingly.
+
+## OpenCitations export
+
+`to_opencitations` turns parsed references (plus, optionally, their linking
+results) into an [OpenCitations crowdsourcing](https://github.com/opencitations/crowdsourcing)
+deposit: META-CSV, the `===###===@@@===` line, then CITS-CSV. Linked references
+get `doi:`, `openalex:`, `wikidata:` and `omid:` ids; the rest get `temp:` ids.
+Repeated footnote references are merged, short forms (ibid., op. cit.) and rows
+[oc_validator](https://github.com/opencitations/oc_validator) would reject are
+dropped and listed in `deposit.dropped`.
+
+One call runs the whole pipeline (no UI needed): references, linking of the records
+that have a title, authors and year, the citing paper's metadata, and the deposit:
+
+```python
+from pathlib import Path
+from citation_index_api_client import CitationIndexClient, CitingDocument
+
+with CitationIndexClient() as client:                      # CITATION_INDEX_API_KEY from env
+    deposit = client.opencitations_deposit("paper.pdf")    # metadata_method="llm" for a fuller citing row
+    # Markdown has no PDF to read metadata from, so name the citing paper:
+    # client.opencitations_deposit("paper.md", citing=CitingDocument(ids="doi:10.1234/abc"))
+Path("paper-opencitations.csv").write_text(deposit.text, encoding="utf-8")
+print(len(deposit.meta) - 1, "works,", len(deposit.dropped), "dropped:", deposit.dropped)
+```
+
+Options: `link=False`, `target=["openalex", "wikidata"]`, `link_method="model"`,
+`citing=` to skip `/extract/metadata`. The steps one by one, if you need them:
+
+```python
+from pathlib import Path
+from citation_index_api_client import to_opencitations
+
+refs = client.wait_for_result(client.process_references_grobid("paper.pdf").job_id)
+# After the references, so the server reuses its cached GROBID run (~3 s).
+# method="llm" (~20 s) gets authors right more often and fills the journal / publisher.
+meta = client.wait_for_result(client.extract_metadata("paper.pdf", method="grobid").job_id)
+
+records = refs["parsed_references"]
+links = [None] * len(records)                   # index-aligned with records
+for n, item in zip(linked_numbers, linked):     # 1-based numbers of linked records
+    links[n - 1] = item
+deposit = to_opencitations(records, links, citing=meta["metadata"])
+Path("deposit.csv").write_text(deposit.text)
+```
+
+If no metadata is found the job fails (`JobFailedError`); then type the citing paper
+in: `CitingDocument(ids="doi:10.1234/abc")`, or without a DOI
+`CitingDocument(title=..., pub_date="2021", authors=["Surname, Given"])`.
+
+> `/extract/metadata` only exists once API PR
+> [odoma-ch/ssh-citation-index#66](https://github.com/odoma-ch/ssh-citation-index/pull/66)
+> is merged and deployed; until then the staging API returns 404. So far it has only
+> been tried against a local Docker build, not staging.
+Validate before depositing: `pip install oc-validator` (part of the `dev` extra).
 
 ## Configuration
 
@@ -176,7 +237,8 @@ link (`GET /`) and whether the key is accepted. The API URL comes only from
 
 **Workflow**
 
-- **End-to-end pipeline** — upload a PDF; references are extracted, parsed,
+- **End-to-end pipeline** — upload a PDF or a Markdown file (Markdown skips
+  text extraction and takes the LLM route); references are extracted, parsed,
   linked and their citing sentences classified, each stage showing its own
   status and job ID. Two routes:
   - *GROBID* (default) — one `/process/references/grobid` job returns raw
@@ -186,7 +248,10 @@ link (`GET /`) and whether the key is accepted. The API URL comes only from
 
   Results land in tabs: one table joining each reference's raw string, parsed
   fields and citation intents; links per target (IDs are clickable); citation
-  intents per sentence; the document text; and everything as one JSON file.
+  intents per sentence; an OpenCitations deposit (CSV; the citing paper's row
+  comes from `/extract/metadata`, GROBID or LLM, and can be typed in by hand
+  instead, which a Markdown upload always needs); the document text; and everything
+  as one JSON file.
   If a later stage fails, earlier results stay.
 
 **Single steps** — each covers one endpoint and can hand its output to the next:
