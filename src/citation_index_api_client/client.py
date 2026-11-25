@@ -15,9 +15,7 @@ from citation_index_api_client.opencitations import (
     to_opencitations,
 )
 
-DEFAULT_BASE_URL = (
-    "https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl"
-)
+DEFAULT_BASE_URL = "https://citation-index.graphia-ssh.eu"
 LINKING_TARGETS = ("openalex", "matilda", "wikidata", "opencitations")
 API_KEY_ENV = "CITATION_INDEX_API_KEY"
 API_KEY_HEADER = "X-API-Key"
