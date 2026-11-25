@@ -1,4 +1,4 @@
-"""End-to-end: PDF -> references -> parsed records -> links + citation intents."""
+"""End-to-end: PDF or Markdown -> references -> parsed records -> links, intents, OpenCitations CSV."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ import pandas as pd
 import streamlit as st
 
 import core
+from citation_index_api_client import CitingDocument, to_opencitations
 
 RUN = "pipeline"
+TEXT_SUFFIXES = (".md", ".markdown", ".txt")
 ROUTES = {
     "grobid": "GROBID — references, parsed records and citing sentences in one job",
     "llm": "LLM — text extraction, then LLM extraction and parsing (no classification)",
@@ -17,8 +19,9 @@ ROUTES = {
 
 st.title("End-to-end pipeline")
 st.caption(
-    "Upload a paper to extract its references, parse them into structured records, "
-    "link them to scholarly indexes and classify why each one is cited."
+    "Upload a paper (PDF, or Markdown text) to extract its references, parse them into "
+    "structured records, link them to scholarly indexes, classify why each one is cited "
+    "and export an OpenCitations deposit."
 )
 
 run = core.current_run(RUN)
@@ -30,7 +33,11 @@ form_box = st.expander(
     icon=":material/upload_file:",
 )
 with form_box, st.form("pipeline-form"):
-    upload = st.file_uploader("Paper (PDF)", type="pdf")
+    upload = st.file_uploader(
+        "Paper (PDF or Markdown)",
+        type=["pdf", "md", "markdown", "txt"],
+        help="Markdown skips text extraction and always takes the LLM route.",
+    )
     route = st.radio("Extraction route", list(ROUTES), format_func=ROUTES.get)
     # ponytail: no nested expander here — older Streamlit raises on expander-in-expander.
     left, right = st.columns(2)
@@ -55,9 +62,12 @@ with form_box, st.form("pipeline-form"):
         elif do_link and not targets:
             st.error("Pick at least one linking target, or turn linking off.")
         else:
+            is_text = upload.name.lower().endswith(TEXT_SUFFIXES)
+            route = "llm" if is_text else route
             core.new_run(
                 RUN,
                 pdf=core.upload_payload(upload),
+                is_text=is_text,
                 route=route,
                 extractor=extractor,
                 parser=parser,
@@ -89,12 +99,15 @@ def extract(run: dict[str, Any]) -> dict[str, Any]:
         }
 
     out: dict[str, Any] = {"references": [], "parsed": [], "contexts": []}
-    text = core.run_job(
-        f"{rid}:text",
-        f"Extracting text ({run['extractor']})",
-        lambda: client.extract_text(core.as_file(pdf), extractor=run["extractor"], filename=pdf["name"]),
-    )
-    out["text"] = (text or {}).get("text") or ""
+    if run.get("is_text"):
+        out["text"] = pdf["data"].decode("utf-8", errors="replace")
+    else:
+        text = core.run_job(
+            f"{rid}:text",
+            f"Extracting text ({run['extractor']})",
+            lambda: client.extract_text(core.as_file(pdf), extractor=run["extractor"], filename=pdf["name"]),
+        )
+        out["text"] = (text or {}).get("text") or ""
     if not out["text"].strip():
         return out
     found = core.run_job(
@@ -150,6 +163,90 @@ def report(run: dict[str, Any], out: dict[str, Any], hits: int, lookups: int, ci
         run["notified"] = True
 
 
+def citing_metadata(run_id: str, pdf: dict[str, Any]) -> dict[str, Any] | None:
+    """The citing paper's own record from /extract/metadata, or None if none was found."""
+    method = st.radio(
+        "Citing paper metadata",
+        ["grobid", "llm"],
+        horizontal=True,
+        key=f"oc-method-{run_id}",
+        help="GROBID reads the PDF header (~3 s, reuses the references run). "
+        "LLM reads the first pages (~20 s): better authors, fills journal and publisher.",
+    )
+    # Not under "{run_id}:", so a paper without metadata does not mark the run failed.
+    result = core.run_job(
+        f"{run_id}-metadata:{method}",
+        f"Citing paper metadata ({method})",
+        lambda: core.client().extract_metadata(core.as_file(pdf), method=method, filename=pdf["name"]),
+    )
+    return (result or {}).get("metadata") or None
+
+
+def opencitations_export(
+    run_id: str,
+    parsed: list[Any],
+    linked: list[Any],
+    numbers: list[int],
+    stem: str,
+    pdf: dict[str, Any] | None = None,
+) -> None:
+    """META-CSV + CITS-CSV deposit for the citing paper (issue #54)."""
+    st.caption(
+        "One deposit file: META-CSV, the `===###===@@@===` line, then CITS-CSV "
+        "([format](https://github.com/opencitations/crowdsourcing)). Linked references get "
+        "DOI / OpenAlex / Wikidata / OMID ids; Matilda ids are not accepted, so with "
+        "Matilda alone most rows carry `temp:` ids. Check it with oc_validator before depositing."
+    )
+    metadata = citing_metadata(run_id, pdf) if pdf else None
+    label = "Enter the citing paper by hand" + (" (overrides the metadata)" if metadata else "")
+    with st.expander(label, expanded=metadata is None):
+        left, right = st.columns(2)
+        doi = left.text_input("Citing paper id", placeholder="doi:10.1234/abc", key=f"oc-id-{run_id}")
+        title = right.text_input("Citing paper title (if no id)", key=f"oc-title-{run_id}")
+        left, right = st.columns(2)
+        date = left.text_input("Publication date (if no id)", placeholder="YYYY or YYYY-MM-DD", key=f"oc-date-{run_id}")
+        authors = right.text_input("Authors (if no id)", placeholder="Surname, Given; Surname, Given", key=f"oc-authors-{run_id}")
+    typed = any(v.strip() for v in (doi, title, date, authors))
+    citing: Any = metadata if metadata and not typed else CitingDocument(
+        ids=doi.strip(),
+        title=title,
+        pub_date=date.strip(),
+        authors=[a for a in authors.split(";") if a.strip()],
+    )
+    # Linking covers only the linkable records, so map results back by record number.
+    links: list[Any] = [None] * len(parsed)
+    for number, item in zip(numbers, linked):
+        links[number - 1] = item
+    try:
+        deposit = to_opencitations(parsed, links, citing=citing)
+    except ValueError as exc:
+        st.info(f"{exc}. Fill in the citing paper above to build the deposit.")
+        return
+    st.caption("Citing paper row (first META row):")
+    st.dataframe(pd.DataFrame(deposit.meta[:1]), hide_index=True, width="stretch")
+    cols = st.columns(3)
+    cols[0].metric("Works (META rows)", len(deposit.meta) - 1)
+    cols[1].metric("Merged repeats", deposit.merged)
+    cols[2].metric("Dropped", len(deposit.dropped))
+    st.download_button(
+        "Download OpenCitations deposit (CSV)",
+        deposit.text.encode("utf-8"),
+        file_name=f"{stem}-opencitations.csv",
+        mime="text/csv",
+        key="oc-csv",
+        on_click="ignore",
+        type="primary",
+    )
+    if deposit.dropped:
+        with st.expander(f"{len(deposit.dropped)} references left out"):
+            st.dataframe(
+                pd.DataFrame([{"#": d.record, "reason": d.reason} for d in deposit.dropped]),
+                hide_index=True,
+                width="stretch",
+            )
+    st.dataframe(pd.DataFrame(deposit.meta), hide_index=True, width="stretch")
+
+
 if run:
     st.subheader(run["pdf"]["name"])
     banner = st.empty()
@@ -182,7 +279,9 @@ if run:
     cols[3].metric("Citing sentences", len(citations) if run["route"] == "grobid" else "—")
 
     stem = core.file_stem(run["pdf"]["name"])
-    tabs = st.tabs(["References", "Links", "Citation intents", "Document text", "Everything (JSON)"])
+    tabs = st.tabs(
+        ["References", "Links", "Citation intents", "OpenCitations", "Document text", "Everything (JSON)"]
+    )
     with tabs[0]:
         if out["references"]:
             core.show_table(references_table(out, intents), f"{stem}-references", key="pipe-refs")
@@ -201,13 +300,21 @@ if run:
         else:
             st.caption("No citation intents.")
     with tabs[3]:
+        if out["parsed"]:
+            opencitations_export(
+                run["id"], out["parsed"], linked, numbers, stem,
+                pdf=None if run.get("is_text") else run["pdf"],
+            )
+        else:
+            st.caption("The export needs parsed references.")
+    with tabs[4]:
         if out.get("text"):
             st.download_button("Download Markdown", out["text"], f"{stem}.md", on_click="ignore")
             with st.container(height=500):
                 st.markdown(out["text"])
         else:
             st.caption("The GROBID route works on the PDF directly, without a text step.")
-    with tabs[4]:
+    with tabs[5]:
         bundle = {
             **{k: v for k, v in out.items() if k != "text"},
             "links": [

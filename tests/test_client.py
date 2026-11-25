@@ -5,6 +5,7 @@ import pytest
 
 from citation_index_api_client import (
     APIError,
+    CitingDocument,
     CitationIndexClient,
     JobFailedError,
     JobTimeoutError,
@@ -79,6 +80,8 @@ def transport(link_requests):
                                     "doi": "10.1234/abc",
                                 },
                                 "wikidata": {"id": None, "doi": None},
+                                "matilda": {"id": None, "doi": None, "score": 0.12},
+                                "opencitations": {"id": None, "doi": None, "error": "timeout"},
                             },
                         }
                     ]
@@ -141,7 +144,20 @@ def test_link_references_single(client, link_requests):
     request = link_requests[-1]
     assert request.url.params["batched"] == "false"
     assert request.url.params["target"] == "all"
+    assert request.url.params["method"] == "match"
+    assert request.url.params["filter_reviews_by_doi"] == "false"
     assert json.loads(request.content) == {"reference": RECORD}
+
+
+def test_link_references_model_method(client, link_requests):
+    client.link_references(
+        {**RECORD, "raw_reference": "Smith (2020). Title."},
+        method="model",
+        filter_reviews_by_doi=True,
+    )
+    params = link_requests[-1].url.params
+    assert params["method"] == "model"
+    assert params["filter_reviews_by_doi"] == "true"
 
 
 def test_link_references_batched(client, link_requests):
@@ -189,6 +205,8 @@ def test_wait_for_links(client):
     )
     assert linked[0].links["openalex"].is_linked
     assert not linked[0].links["wikidata"].is_linked
+    assert linked[0].links["matilda"].score == 0.12
+    assert linked[0].links["opencitations"].error == "timeout"
 
 
 def test_extract_text_file(tmp_path, client):
@@ -327,3 +345,73 @@ def test_classify_citations(monkeypatch):
     assert json.loads(request.content) == {"citations": contexts}
     with pytest.raises(ValueError):
         client.classify_citations([])
+
+
+def test_extract_metadata(tmp_path, monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    client.extract_metadata(pdf)
+    assert requests[-1].url.path == "/extract/metadata"
+    assert requests[-1].url.params["method"] == "grobid"
+    assert b'filename="paper.pdf"' in requests[-1].read()
+    client.extract_metadata(pdf, method="llm")
+    assert requests[-1].url.params["method"] == "llm"
+
+
+def _pipeline_client(monkeypatch):
+    """Answers every job endpoint the end-to-end deposit uses; records request paths."""
+    monkeypatch.delenv("CITATION_INDEX_API_KEY", raising=False)
+    article = {
+        "full_title": "Citation networks", "authors": [{"surname": "Berg", "first_name": "Jan"}],
+        "publication_year": 2019, "journal_title": "J Doc",
+    }
+    results = {
+        "grobid": {"references": ["Berg 2019"], "parsed_references": [{"full_title": "Ibid."}, article]},
+        "refs": {"references": ["Berg 2019"]},
+        "parse": {"references": [article]},
+        "meta": {"metadata": {
+            "full_title": "Citing paper", "authors": [{"surname": "Rossi"}], "publication_year": 2021,
+            "identifiers": [{"scheme": "doi", "value": "10.1/citing", "normalized": "10.1/citing"}],
+        }, "method": "grobid"},
+        "link": {"results": [{"reference": article, "links": {"openalex": {"id": "https://openalex.org/W9"}}}]},
+    }
+    jobs = {"/process/references/grobid": "grobid", "/extract/references": "refs",
+            "/parse/references": "parse", "/extract/metadata": "meta", "/link/references": "link"}
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        paths.append(path)
+        if path in jobs:
+            return httpx.Response(200, json={"job_id": jobs[path], "status": "queued", "created_at": "t"})
+        job = path.split("/")[2]
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"job_id": job, "status": "completed"})
+        return httpx.Response(200, json=results[job])
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.example")
+    return CitationIndexClient(client=http), paths
+
+
+def test_opencitations_deposit_pdf(tmp_path, monkeypatch):
+    client, paths = _pipeline_client(monkeypatch)
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    deposit = client.opencitations_deposit(pdf, poll_interval=0)
+    posts = [p for p in paths if not p.startswith("/jobs/")]
+    assert posts == ["/process/references/grobid", "/extract/metadata", "/link/references"]
+    assert deposit.meta[0]["id"] == "doi:10.1/citing"
+    assert deposit.meta[1]["id"] == "openalex:W9"  # link mapped back past the skipped ibid.
+    assert deposit.cits == ({"citing_id": "doi:10.1/citing", "cited_id": "openalex:W9"},)
+
+
+def test_opencitations_deposit_markdown(tmp_path, monkeypatch):
+    client, paths = _pipeline_client(monkeypatch)
+    md = tmp_path / "paper.md"
+    md.write_text("# Paper\n\nBerg 2019", encoding="utf-8")
+    with pytest.raises(ValueError, match="citing"):
+        client.opencitations_deposit(md)
+    deposit = client.opencitations_deposit(md, citing=CitingDocument(ids="doi:10.1/md"), link=False, poll_interval=0)
+    assert [p for p in paths if not p.startswith("/jobs/")] == ["/extract/references", "/parse/references"]
+    assert deposit.meta[1]["id"] == "temp:1"

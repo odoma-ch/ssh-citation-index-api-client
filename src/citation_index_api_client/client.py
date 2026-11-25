@@ -9,6 +9,11 @@ import httpx
 
 from citation_index_api_client.exceptions import APIError, JobFailedError, JobTimeoutError
 from citation_index_api_client.models import JobResponse, JobStatus, LinkedReference
+from citation_index_api_client.opencitations import (
+    CitingDocument,
+    OpenCitationsDeposit,
+    to_opencitations,
+)
 
 DEFAULT_BASE_URL = (
     "https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl"
@@ -16,6 +21,7 @@ DEFAULT_BASE_URL = (
 LINKING_TARGETS = ("openalex", "matilda", "wikidata", "opencitations")
 API_KEY_ENV = "CITATION_INDEX_API_KEY"
 API_KEY_HEADER = "X-API-Key"
+TEXT_SUFFIXES = (".md", ".markdown", ".txt")
 
 
 def is_linkable(record: Mapping[str, Any]) -> bool:
@@ -230,6 +236,24 @@ class CitationIndexClient:
             params={"include_context": include_context},
         )
 
+    def extract_metadata(
+        self,
+        file: str | Path | BinaryIO,
+        *,
+        method: str = "grobid",
+        filename: str | None = None,
+    ) -> JobResponse:
+        """POST /extract/metadata — enqueue metadata extraction of the PDF itself.
+
+        The result is ``{"metadata": {...}, "method": ...}``; ``metadata`` has the
+        shape of a parsed reference and can be passed as ``citing`` to
+        :func:`~citation_index_api_client.to_opencitations`. ``method`` is
+        ``grobid`` (TEI header; fast when the same PDF already went through a
+        GROBID endpoint) or ``llm`` (first pages; better authors, fills
+        ``journal_title`` / ``publisher``). No metadata found fails the job.
+        """
+        return self._upload("/extract/metadata", file, filename=filename, params={"method": method})
+
     def parse_references(
         self,
         references: list[str],
@@ -255,8 +279,17 @@ class CitationIndexClient:
         references: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         *,
         target: str | Sequence[str] = "all",
+        method: str = "match",
+        filter_reviews_by_doi: bool = False,
     ) -> JobResponse:
-        """POST /link/references — enqueue linking against external indexes."""
+        """POST /link/references — enqueue linking against external indexes.
+
+        ``method`` is ``match`` (title/author/year rules) or ``model`` (the
+        fine-tuned decider picks among the search results; every record then
+        needs ``raw_reference``, the original citation string).
+        ``filter_reviews_by_doi`` drops candidates whose DOI only names a book
+        review before choosing.
+        """
         # A dict is a Sequence-like iterable, so it must be matched before the
         # list branch — otherwise a single record would be iterated by key.
         if isinstance(references, dict):
@@ -275,6 +308,8 @@ class CitationIndexClient:
             params={
                 "batched": batched,
                 "target": target if isinstance(target, str) else ",".join(target),
+                "method": method,
+                "filter_reviews_by_doi": filter_reviews_by_doi,
             },
         )
         return JobResponse.from_dict(data)
@@ -313,6 +348,54 @@ class CitationIndexClient:
             job_id, poll_interval=poll_interval, timeout=timeout
         )
         return [LinkedReference.from_dict(item) for item in result.get("results", [])]
+
+    def opencitations_deposit(
+        self,
+        file: str | Path,
+        *,
+        citing: CitingDocument | Mapping[str, Any] | None = None,
+        metadata_method: str = "grobid",
+        link: bool = True,
+        target: str | Sequence[str] = "all",
+        link_method: str = "match",
+        poll_interval: float = 2.0,
+        timeout: float = 1800.0,
+    ) -> OpenCitationsDeposit:
+        """PDF or Markdown file to an OpenCitations deposit, end to end.
+
+        A PDF goes through ``/process/references/grobid``; a ``.md`` /
+        ``.markdown`` / ``.txt`` file through LLM extraction and parsing. The
+        records that have a title, authors and a year are then linked (unless
+        ``link=False``). Without ``citing``, a PDF's own row comes from
+        ``/extract/metadata`` (``metadata_method``); a Markdown file needs
+        ``citing``. If the API finds no metadata, ``JobFailedError``
+        is raised: pass ``citing`` then. Write ``deposit.text`` to a file to deposit it.
+        """
+        path = Path(file)
+        wait = {"poll_interval": poll_interval, "timeout": timeout}
+        if path.suffix.lower() in TEXT_SUFFIXES:
+            if citing is None:
+                raise ValueError("A Markdown file needs citing=: there is no PDF to read metadata from")
+            text = path.read_text(encoding="utf-8")
+            found = self.wait_for_result(self.extract_references(text).job_id, **wait)
+            strings = found.get("references") or []
+            parsed = self.wait_for_result(self.parse_references(strings).job_id, **wait) if strings else {}
+            records = parsed.get("references") or []
+        else:
+            result = self.wait_for_result(self.process_references_grobid(path).job_id, **wait)
+            records = result.get("parsed_references") or []
+            if citing is None:
+                # After the references, so the server reuses its cached GROBID run.
+                job = self.extract_metadata(path, method=metadata_method)
+                citing = self.wait_for_result(job.job_id, **wait)["metadata"]
+
+        links: list[LinkedReference | None] = [None] * len(records)
+        numbered = [(i, r) for i, r in enumerate(records) if r and is_linkable(r)]
+        if link and numbered:
+            job = self.link_references([r for _, r in numbered], target=target, method=link_method)
+            for (i, _), linked in zip(numbered, self.wait_for_links(job.job_id, **wait)):
+                links[i] = linked
+        return to_opencitations(records, links, citing=citing)
 
     def _upload(
         self,
