@@ -2,7 +2,7 @@
 
 Python client for the [Citation Index API](https://citation-index-api-graphia-app1-staging.apps.bst2.paas.psnc.pl/openapi.json), which extracts and parses citations from academic PDFs and links them to external scholarly indexes.
 
-The client version tracks the API version it targets: **0.6.0**.
+The client version tracks the API version it targets: **1.0.0-beta.1** (Python package version `1.0.0b1`).
 
 ## Install
 
